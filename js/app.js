@@ -9,15 +9,11 @@
         'pages/عصير_Page_4.png',
         'pages/عصير_Page_5.png'
     ];
+    const A4_RATIO = 21 / 29.7;
 
-    const A4_WIDTH = 21;
-    const A4_HEIGHT = 29.7;
-    const A4_RATIO = A4_WIDTH / A4_HEIGHT; // ~0.7071
-
-    // ─── DOM Elements ───
+    // ─── DOM ───
     const canvas = document.getElementById('flipbook-canvas');
     const ctx = canvas.getContext('2d');
-    const container = document.getElementById('flipbook-container');
     const navLeft = document.getElementById('nav-left');
     const navRight = document.getElementById('nav-right');
     const pageIndicator = document.getElementById('page-indicator');
@@ -26,541 +22,504 @@
     let pages = [];
     let currentPage = 0;
     let totalPages = 0;
+    let pageW = 0, pageH = 0, dpr = 1;
 
-    // Flip animation state
-    let isFlipping = false;
+    // Interaction
     let isDragging = false;
-    let flipProgress = 0; // 0 = no flip, 1 = fully flipped
-    let flipDirection = 0; // 1 = forward, -1 = backward
-    let dragStartX = 0;
-    let dragCurrentX = 0;
-    let animationId = null;
+    let isAnimating = false;
+    let flipDirection = 0; // 1=forward, -1=backward
+    let cornerOrigin = { x: 0, y: 0 };
+    let pointerPos = { x: 0, y: 0 };
 
-    // Dimensions
-    let pageW = 0;
-    let pageH = 0;
-    let canvasW = 0;
-    let canvasH = 0;
-
-    // ─── Audio: Paper flip sound via Web Audio API ───
+    // Audio
     let audioCtx = null;
 
+    // ─── Audio ───
     function initAudio() {
-        if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        }
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
 
     function playFlipSound() {
         if (!audioCtx) return;
         try {
             const now = audioCtx.currentTime;
+            const sr = audioCtx.sampleRate;
 
-            // Layer 1: Initial crisp "grab" — short burst of filtered noise
-            const grabLen = Math.round(audioCtx.sampleRate * 0.06);
-            const grabBuf = audioCtx.createBuffer(1, grabLen, audioCtx.sampleRate);
-            const grabData = grabBuf.getChannelData(0);
-            for (let i = 0; i < grabLen; i++) {
-                const t = i / audioCtx.sampleRate;
-                const env = Math.exp(-t * 60) * 0.25;
-                grabData[i] = (Math.random() * 2 - 1) * env;
-            }
-            const grabSrc = audioCtx.createBufferSource();
-            grabSrc.buffer = grabBuf;
-            const grabFilter = audioCtx.createBiquadFilter();
-            grabFilter.type = 'bandpass';
-            grabFilter.frequency.value = 3000;
-            grabFilter.Q.value = 1.5;
-            grabSrc.connect(grabFilter);
-            grabFilter.connect(audioCtx.destination);
-            grabSrc.start(now);
+            // Crisp grab
+            const g = audioCtx.createBuffer(1, Math.round(sr * 0.06), sr);
+            const gd = g.getChannelData(0);
+            for (let i = 0; i < gd.length; i++) gd[i] = (Math.random() * 2 - 1) * Math.exp(-(i / sr) * 60) * 0.22;
+            const gs = audioCtx.createBufferSource(); gs.buffer = g;
+            const gf = audioCtx.createBiquadFilter(); gf.type = 'bandpass'; gf.frequency.value = 3200; gf.Q.value = 1.2;
+            gs.connect(gf).connect(audioCtx.destination); gs.start(now);
 
-            // Layer 2: Paper sliding swoosh — longer filtered noise
-            const swooshLen = Math.round(audioCtx.sampleRate * 0.25);
-            const swooshBuf = audioCtx.createBuffer(1, swooshLen, audioCtx.sampleRate);
-            const swooshData = swooshBuf.getChannelData(0);
-            for (let i = 0; i < swooshLen; i++) {
-                const t = i / audioCtx.sampleRate;
-                // Bell-shaped envelope peaking at ~0.08s
-                const env = Math.exp(-Math.pow((t - 0.08) / 0.06, 2)) * 0.15;
-                swooshData[i] = (Math.random() * 2 - 1) * env;
+            // Paper swoosh
+            const s = audioCtx.createBuffer(1, Math.round(sr * 0.28), sr);
+            const sd = s.getChannelData(0);
+            for (let i = 0; i < sd.length; i++) {
+                const t = i / sr;
+                sd[i] = (Math.random() * 2 - 1) * Math.exp(-Math.pow((t - 0.08) / 0.06, 2)) * 0.14;
             }
-            // Smooth the noise for softer paper texture
-            for (let pass = 0; pass < 3; pass++) {
-                for (let i = 1; i < swooshLen - 1; i++) {
-                    swooshData[i] = (swooshData[i - 1] + swooshData[i] * 2 + swooshData[i + 1]) / 4;
-                }
-            }
-            const swooshSrc = audioCtx.createBufferSource();
-            swooshSrc.buffer = swooshBuf;
-            const swooshFilter = audioCtx.createBiquadFilter();
-            swooshFilter.type = 'lowpass';
-            swooshFilter.frequency.value = 2500;
-            swooshSrc.connect(swooshFilter);
-            swooshFilter.connect(audioCtx.destination);
-            swooshSrc.start(now + 0.02);
+            for (let p = 0; p < 3; p++) for (let i = 1; i < sd.length - 1; i++) sd[i] = (sd[i - 1] + sd[i] * 2 + sd[i + 1]) / 4;
+            const ss = audioCtx.createBufferSource(); ss.buffer = s;
+            const sf = audioCtx.createBiquadFilter(); sf.type = 'lowpass'; sf.frequency.value = 2500;
+            ss.connect(sf).connect(audioCtx.destination); ss.start(now + 0.02);
 
-            // Layer 3: Soft thump when page lands
-            const thumpOsc = audioCtx.createOscillator();
-            thumpOsc.type = 'sine';
-            thumpOsc.frequency.value = 80;
-            const thumpGain = audioCtx.createGain();
-            thumpGain.gain.setValueAtTime(0, now + 0.18);
-            thumpGain.gain.linearRampToValueAtTime(0.08, now + 0.2);
-            thumpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
-            thumpOsc.connect(thumpGain);
-            thumpGain.connect(audioCtx.destination);
-            thumpOsc.start(now + 0.18);
-            thumpOsc.stop(now + 0.35);
-        } catch (e) {
-            // Silently fail
-        }
+            // Soft thump
+            const o = audioCtx.createOscillator(); o.type = 'sine'; o.frequency.value = 75;
+            const og = audioCtx.createGain();
+            og.gain.setValueAtTime(0, now + 0.2);
+            og.gain.linearRampToValueAtTime(0.07, now + 0.22);
+            og.gain.exponentialRampToValueAtTime(0.001, now + 0.34);
+            o.connect(og).connect(audioCtx.destination); o.start(now + 0.2); o.stop(now + 0.4);
+        } catch (_) { }
     }
 
     // ─── Image Loading ───
     function loadImages() {
-        return Promise.all(
-            PAGE_FILES.map(src => {
-                return new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.onload = () => resolve(img);
-                    img.onerror = () => reject(new Error(`Failed to load: ${src}`));
-                    img.src = src;
-                });
-            })
-        );
+        return Promise.all(PAGE_FILES.map(src => new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Failed: ' + src));
+            img.src = src;
+        })));
     }
 
     // ─── Sizing ───
     function calculateDimensions() {
-        const vw = window.innerWidth;
-        const vh = window.innerHeight;
+        const vw = window.innerWidth, vh = window.innerHeight;
         const isMobile = vw <= 768;
-
-        // Target 80% of viewport width on desktop, 95% on mobile
-        let targetW = isMobile ? vw * 0.95 : vw * 0.80;
-        let targetH = targetW / A4_RATIO;
-
-        // Ensure it fits in viewport height (leave room for indicators)
+        let tw = isMobile ? vw * 0.93 : vw * 0.85;
+        let th = tw / A4_RATIO;
         const maxH = vh * 0.88;
-        if (targetH > maxH) {
-            targetH = maxH;
-            targetW = targetH * A4_RATIO;
-        }
-
-        pageW = Math.round(targetW);
-        pageH = Math.round(targetH);
-        canvasW = pageW;
-        canvasH = pageH;
-
-        const dpr = window.devicePixelRatio || 1;
-        canvas.width = canvasW * dpr;
-        canvas.height = canvasH * dpr;
-        canvas.style.width = canvasW + 'px';
-        canvas.style.height = canvasH + 'px';
+        if (th > maxH) { th = maxH; tw = th * A4_RATIO; }
+        pageW = Math.round(Math.max(tw, 260));
+        pageH = Math.round(pageW / A4_RATIO);
+        dpr = window.devicePixelRatio || 1;
+        canvas.width = pageW * dpr;
+        canvas.height = pageH * dpr;
+        canvas.style.width = pageW + 'px';
+        canvas.style.height = pageH + 'px';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
-    // ─── Rendering ───
-    function render() {
-        ctx.clearRect(0, 0, canvasW, canvasH);
+    // ══════════════════════════════════════════════════════
+    // ─── FOLD-LINE GEOMETRY ───
+    // The fold line = perpendicular bisector of segment Corner→Pointer.
+    // foldNorm points toward the corner (the "folded-away" side).
+    // ══════════════════════════════════════════════════════
 
-        if (totalPages === 0) return;
-
-        // Draw current page (base layer)
-        drawPage(currentPage, 0, 0, pageW, pageH);
-
-        // Draw flip animation if active
-        if ((isFlipping || isDragging) && flipProgress > 0) {
-            drawFlipEffect();
-        }
+    function computeFold(corner, pointer) {
+        const dx = pointer.x - corner.x, dy = pointer.y - corner.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 1) return null;
+        return {
+            mx: (corner.x + pointer.x) / 2,
+            my: (corner.y + pointer.y) / 2,
+            fdx: -dy / dist, fdy: dx / dist,   // fold-line direction
+            fnx: -dx / dist, fny: -dy / dist,   // normal → toward corner
+            dist
+        };
     }
 
-    function drawPage(index, x, y, w, h) {
-        if (index < 0 || index >= totalPages) {
-            // Draw blank page
-            ctx.fillStyle = '#f5f0e8';
-            ctx.fillRect(x, y, w, h);
-            return;
-        }
-        ctx.drawImage(pages[index], x, y, w, h);
+    // Constrain pointer so fold line stays on the page
+    function constrainPointer(corner, ptr) {
+        let px = ptr.x, py = ptr.y;
+        const margin = 30;
+        // Keep midpoint roughly within page
+        let mmx = (corner.x + px) / 2, mmy = (corner.y + py) / 2;
+        if (mmx < -margin) px = 2 * (-margin) - corner.x;
+        if (mmx > pageW + margin) px = 2 * (pageW + margin) - corner.x;
+        if (mmy < -margin) py = 2 * (-margin) - corner.y;
+        if (mmy > pageH + margin) py = 2 * (pageH + margin) - corner.y;
+        return { x: px, y: py };
     }
 
-    function drawFlipEffect() {
-        const progress = flipProgress;
-        const dir = flipDirection;
+    // ─── Clip to one side of the fold line (with optional Bezier bow) ───
+    // cornerSide=true → keep corner side  |  false → keep opposite side
+    // The curve always bows toward the KEPT side for a paper-bend illusion.
+    function clipFold(f, cornerSide, curvature) {
+        const sign = cornerSide ? 1 : -1;
+        const ext = (pageW + pageH) * 2;
+        const lx1 = f.mx - f.fdx * ext, ly1 = f.my - f.fdy * ext;
+        const lx2 = f.mx + f.fdx * ext, ly2 = f.my + f.fdy * ext;
+        const ox = f.fnx * ext * sign, oy = f.fny * ext * sign;
 
-        // The page being flipped
-        const flippingPageIndex = dir === 1 ? currentPage : currentPage - 1;
-        // The page revealed underneath
-        const underPageIndex = dir === 1 ? currentPage + 1 : currentPage - 1;
+        // Control point always bows toward the KEPT side (away from corner)
+        const cpx = f.mx - f.fnx * curvature;
+        const cpy = f.my - f.fny * curvature;
 
-        if (dir === -1 && currentPage <= 0 && !isDragging) return;
-        if (dir === 1 && currentPage >= totalPages - 1 && !isDragging) return;
-
-        ctx.save();
-
-        // Calculate fold position
-        const foldX = dir === 1
-            ? pageW * (1 - progress)
-            : pageW * progress;
-
-        // Draw the page underneath (revealed page)
-        ctx.save();
         ctx.beginPath();
-        if (dir === 1) {
-            ctx.rect(foldX, 0, pageW - foldX, pageH);
+        ctx.moveTo(lx1, ly1);
+        if (curvature > 0.5) {
+            ctx.quadraticCurveTo(cpx, cpy, lx2, ly2);
         } else {
-            ctx.rect(0, 0, foldX, pageH);
+            ctx.lineTo(lx2, ly2);
         }
+        ctx.lineTo(lx2 + ox, ly2 + oy);
+        ctx.lineTo(lx1 + ox, ly1 + oy);
+        ctx.closePath();
         ctx.clip();
-        if (underPageIndex >= 0 && underPageIndex < totalPages) {
-            drawPage(underPageIndex, 0, 0, pageW, pageH);
+    }
+
+    // Reflect coordinate system across the fold line
+    function reflectAcrossFold(f) {
+        const nx = f.fnx, ny = f.fny, mx = f.mx, my = f.my;
+        const dot = nx * mx + ny * my;
+        ctx.transform(1 - 2 * nx * nx, -2 * nx * ny, -2 * nx * ny, 1 - 2 * ny * ny,
+            2 * nx * dot, 2 * ny * dot);
+    }
+
+    // ══════════════════════════════════════════════════════
+    // ─── RENDERING ───
+    // ══════════════════════════════════════════════════════
+
+    function render() {
+        ctx.clearRect(0, 0, pageW, pageH);
+        if (totalPages === 0) return;
+        if (isDragging || isAnimating) {
+            renderCurl();
+        } else {
+            drawPage(currentPage);
+        }
+    }
+
+    function drawPage(idx) {
+        if (idx >= 0 && idx < totalPages) {
+            ctx.drawImage(pages[idx], 0, 0, pageW, pageH);
         } else {
             ctx.fillStyle = '#f5f0e8';
             ctx.fillRect(0, 0, pageW, pageH);
         }
+    }
 
-        // Shadow on revealed page
-        const shadowWidth = Math.min(40, pageW * progress * 0.15);
-        if (dir === 1) {
-            const grad = ctx.createLinearGradient(foldX, 0, foldX + shadowWidth, 0);
-            grad.addColorStop(0, 'rgba(0,0,0,0.3)');
-            grad.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(foldX, 0, shadowWidth, pageH);
-        } else {
-            const grad = ctx.createLinearGradient(foldX, 0, foldX - shadowWidth, 0);
-            grad.addColorStop(0, 'rgba(0,0,0,0.3)');
-            grad.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(foldX - shadowWidth, 0, shadowWidth, pageH);
-        }
-        ctx.restore();
+    function renderCurl() {
+        const cPtr = constrainPointer(cornerOrigin, pointerPos);
+        const f = computeFold(cornerOrigin, cPtr);
+        if (!f) { drawPage(currentPage); return; }
 
-        // Draw the flipping page with curl effect
+        const diag = Math.sqrt(pageW * pageW + pageH * pageH);
+        const progress = Math.min(1, f.dist / diag);
+        const curvature = Math.sin(progress * Math.PI) * pageW * 0.06;
+
+        const revealIdx = flipDirection === 1 ? currentPage + 1 : currentPage - 1;
+
+        // ── Layer 1: Revealed page (next/prev) visible in the folded-away region ──
         ctx.save();
-
-        // Curl width proportional to progress
-        const curlWidth = pageW * progress;
-        const curlAmount = Math.sin(progress * Math.PI) * 0.15; // bend intensity
-
-        if (dir === 1) {
-            // Forward flip: page curls from right to left
-            ctx.beginPath();
-            ctx.moveTo(foldX, 0);
-
-            // Top edge with curve
-            const topCurveX = foldX + curlWidth * 0.5;
-            const topCurveControlX = foldX + curlWidth * curlAmount;
-            ctx.quadraticCurveTo(topCurveControlX, -pageH * curlAmount * 0.3, foldX + curlWidth, 0);
-
-            // Right edge
-            ctx.lineTo(foldX + curlWidth, pageH);
-
-            // Bottom edge with curve
-            ctx.quadraticCurveTo(topCurveControlX, pageH + pageH * curlAmount * 0.3, foldX, pageH);
-
-            ctx.closePath();
-            ctx.clip();
-
-            // Draw the back of the flipping page (paper-white back)
-            ctx.save();
-            // Cream/off-white paper back
-            ctx.fillStyle = '#f5f0e8';
-            ctx.fillRect(foldX, 0, curlWidth, pageH);
-            // Subtle paper texture using a light gradient
-            const backGrad = ctx.createLinearGradient(foldX, 0, foldX + curlWidth, 0);
-            backGrad.addColorStop(0, 'rgba(200,190,175,0.12)');
-            backGrad.addColorStop(0.5, 'rgba(255,255,250,0.05)');
-            backGrad.addColorStop(1, 'rgba(180,170,155,0.15)');
-            ctx.fillStyle = backGrad;
-            ctx.fillRect(foldX, 0, curlWidth, pageH);
-            ctx.restore();
-
-            // Paper texture gradient on curled page
-            const curlGrad = ctx.createLinearGradient(foldX, 0, foldX + curlWidth, 0);
-            curlGrad.addColorStop(0, 'rgba(0,0,0,0.08)');
-            curlGrad.addColorStop(0.3, 'rgba(255,255,255,0.1)');
-            curlGrad.addColorStop(0.5, 'rgba(0,0,0,0.02)');
-            curlGrad.addColorStop(0.7, 'rgba(255,255,255,0.08)');
-            curlGrad.addColorStop(1, 'rgba(0,0,0,0.15)');
-            ctx.fillStyle = curlGrad;
-            ctx.fill();
-
-        } else {
-            // Backward flip: page curls from left to right
-            const startX = foldX - curlWidth;
-            ctx.beginPath();
-            ctx.moveTo(foldX, 0);
-
-            const controlX = foldX - curlWidth * curlAmount;
-            ctx.quadraticCurveTo(controlX, -pageH * curlAmount * 0.3, startX, 0);
-            ctx.lineTo(startX, pageH);
-            ctx.quadraticCurveTo(controlX, pageH + pageH * curlAmount * 0.3, foldX, pageH);
-
-            ctx.closePath();
-            ctx.clip();
-
-            // Draw the back of the flipping page (paper-white back)
-            ctx.save();
-            ctx.fillStyle = '#f5f0e8';
-            ctx.fillRect(startX, 0, curlWidth, pageH);
-            const backGrad2 = ctx.createLinearGradient(foldX, 0, startX, 0);
-            backGrad2.addColorStop(0, 'rgba(200,190,175,0.12)');
-            backGrad2.addColorStop(0.5, 'rgba(255,255,250,0.05)');
-            backGrad2.addColorStop(1, 'rgba(180,170,155,0.15)');
-            ctx.fillStyle = backGrad2;
-            ctx.fillRect(startX, 0, curlWidth, pageH);
-            ctx.restore();
-
-            // Paper texture
-            const curlGrad = ctx.createLinearGradient(foldX, 0, startX, 0);
-            curlGrad.addColorStop(0, 'rgba(0,0,0,0.08)');
-            curlGrad.addColorStop(0.3, 'rgba(255,255,255,0.1)');
-            curlGrad.addColorStop(0.5, 'rgba(0,0,0,0.02)');
-            curlGrad.addColorStop(1, 'rgba(0,0,0,0.15)');
-            ctx.fillStyle = curlGrad;
-            ctx.fill();
+        ctx.beginPath(); ctx.rect(0, 0, pageW, pageH); ctx.clip();
+        clipFold(f, true, curvature);
+        drawPage(revealIdx);
+        // Shadow on revealed page near the fold
+        const sw = Math.min(70, pageW * progress * 0.25);
+        if (sw > 2) {
+            const sg = ctx.createLinearGradient(
+                f.mx + f.fnx * 1, f.my + f.fny * 1,
+                f.mx + f.fnx * sw, f.my + f.fny * sw);
+            const sa = Math.min(0.45, progress * 0.55);
+            sg.addColorStop(0, 'rgba(0,0,0,' + sa + ')');
+            sg.addColorStop(0.35, 'rgba(0,0,0,' + (sa * 0.35) + ')');
+            sg.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = sg;
+            ctx.fillRect(-50, -50, pageW + 100, pageH + 100);
         }
-
         ctx.restore();
+
+        // ── Layer 2: Current page — the unfolded (kept) part ──
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, 0, pageW, pageH); ctx.clip();
+        clipFold(f, false, curvature);
+        drawPage(currentPage);
+        // Light highlight near fold edge on front
+        if (progress > 0.015) {
+            const hw = Math.min(25, pageW * progress * 0.12);
+            const hg = ctx.createLinearGradient(
+                f.mx - f.fnx * 1, f.my - f.fny * 1,
+                f.mx - f.fnx * hw, f.my - f.fny * hw);
+            hg.addColorStop(0, 'rgba(255,255,255,' + Math.min(0.14, progress * 0.18) + ')');
+            hg.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = hg;
+            ctx.fillRect(-50, -50, pageW + 100, pageH + 100);
+        }
         ctx.restore();
-    }
 
-    // ─── Flip Animation ───
-    function animateFlip(direction, fromProgress) {
-        if (isFlipping) return;
+        // ── Layer 3: Back of the curl (reflected paper back) ──
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, 0, pageW, pageH); ctx.clip();
+        clipFold(f, true, curvature);
 
-        const targetPage = currentPage + direction;
-        if (targetPage < 0 || targetPage >= totalPages) return;
+        ctx.save();
+        reflectAcrossFold(f);
+        ctx.beginPath(); ctx.rect(0, 0, pageW, pageH); ctx.clip();
+        // Draw cream paper back
+        ctx.fillStyle = '#efe9df';
+        ctx.fillRect(0, 0, pageW, pageH);
+        // Faint bleed-through
+        ctx.globalAlpha = 0.05;
+        drawPage(currentPage);
+        ctx.globalAlpha = 1;
+        ctx.restore();
 
-        isFlipping = true;
-        flipDirection = direction;
-        const startProgress = fromProgress || 0;
-        const startTime = performance.now();
-        const duration = 400 * (1 - startProgress); // Faster if already dragged partway
+        // Curvature shading on the curl back
+        const cw = Math.max(20, f.dist * 0.6);
+        const cg = ctx.createLinearGradient(
+            f.mx - f.fnx * 2, f.my - f.fny * 2,
+            f.mx + f.fnx * cw, f.my + f.fny * cw);
+        cg.addColorStop(0, 'rgba(0,0,0,0.18)');
+        cg.addColorStop(0.08, 'rgba(255,255,255,0.07)');
+        cg.addColorStop(0.18, 'rgba(0,0,0,0.04)');
+        cg.addColorStop(0.5, 'rgba(255,255,255,0.03)');
+        cg.addColorStop(0.8, 'rgba(0,0,0,0.06)');
+        cg.addColorStop(1, 'rgba(0,0,0,0.12)');
+        ctx.fillStyle = cg;
+        ctx.fillRect(-50, -50, pageW + 100, pageH + 100);
+        ctx.restore();
 
-        playFlipSound();
+        // ── Layer 4: Fold edge (paper thickness line) ──
+        if (progress > 0.01) {
+            ctx.save();
+            ctx.beginPath(); ctx.rect(0, 0, pageW, pageH); ctx.clip();
+            const ext = (pageW + pageH) * 2;
+            const cpx = f.mx - f.fnx * curvature;
+            const cpy = f.my - f.fny * curvature;
 
-        function step(now) {
-            const elapsed = now - startTime;
-            const t = Math.min(elapsed / duration, 1);
-            // Ease out cubic
-            const eased = 1 - Math.pow(1 - t, 3);
-            flipProgress = startProgress + (1 - startProgress) * eased;
-
-            render();
-
-            if (t < 1) {
-                animationId = requestAnimationFrame(step);
+            ctx.beginPath();
+            ctx.moveTo(f.mx - f.fdx * ext, f.my - f.fdy * ext);
+            if (curvature > 0.5) {
+                ctx.quadraticCurveTo(cpx, cpy, f.mx + f.fdx * ext, f.my + f.fdy * ext);
             } else {
-                // Flip complete
-                currentPage = targetPage;
-                flipProgress = 0;
-                isFlipping = false;
-                flipDirection = 0;
-                render();
-                updateUI();
+                ctx.lineTo(f.mx + f.fdx * ext, f.my + f.fdy * ext);
             }
-        }
+            ctx.strokeStyle = 'rgba(80,70,60,' + Math.min(0.3, progress * 0.4) + ')';
+            ctx.lineWidth = Math.min(1.8, progress * 2.5);
+            ctx.stroke();
 
-        animationId = requestAnimationFrame(step);
-    }
-
-    function animateSnapBack(fromProgress) {
-        isFlipping = true;
-        const startProgress = fromProgress;
-        const startTime = performance.now();
-        const duration = 300;
-
-        function step(now) {
-            const elapsed = now - startTime;
-            const t = Math.min(elapsed / duration, 1);
-            const eased = 1 - Math.pow(1 - t, 3);
-            flipProgress = startProgress * (1 - eased);
-
-            render();
-
-            if (t < 1) {
-                animationId = requestAnimationFrame(step);
+            // Paper edge highlight
+            ctx.beginPath();
+            ctx.moveTo(f.mx - f.fdx * ext - f.fnx * 1.5, f.my - f.fdy * ext - f.fny * 1.5);
+            if (curvature > 0.5) {
+                ctx.quadraticCurveTo(cpx - f.fnx * 1.5, cpy - f.fny * 1.5,
+                    f.mx + f.fdx * ext - f.fnx * 1.5, f.my + f.fdy * ext - f.fny * 1.5);
             } else {
-                flipProgress = 0;
-                isFlipping = false;
-                flipDirection = 0;
-                isDragging = false;
-                render();
+                ctx.lineTo(f.mx + f.fdx * ext - f.fnx * 1.5, f.my + f.fdy * ext - f.fny * 1.5);
             }
+            ctx.strokeStyle = 'rgba(255,255,240,' + Math.min(0.15, progress * 0.2) + ')';
+            ctx.lineWidth = 0.8;
+            ctx.stroke();
+            ctx.restore();
         }
-
-        animationId = requestAnimationFrame(step);
     }
 
-    // ─── Drag Interaction ───
-    function getCanvasPos(e) {
+    // ══════════════════════════════════════════════════════
+    // ─── POINTER INTERACTION ───
+    // ══════════════════════════════════════════════════════
+
+    function getPointerPos(e) {
         const rect = canvas.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const cx = e.touches ? e.touches[0].clientX : e.clientX;
+        const cy = e.touches ? e.touches[0].clientY : e.clientY;
         return {
-            x: clientX - rect.left,
-            y: clientY - rect.top
+            x: (cx - rect.left) * (pageW / rect.width),
+            y: (cy - rect.top) * (pageH / rect.height)
         };
     }
 
     function onPointerDown(e) {
-        if (isFlipping) return;
+        if (isAnimating) return;
         initAudio();
+        const pos = getPointerPos(e);
+        const edgeZone = pageW * 0.30;
 
-        const pos = getCanvasPos(e);
-        const edgeZone = pageW * 0.25; // 25% from each edge is drag zone
-
+        // Right edge → flip forward
         if (pos.x > pageW - edgeZone && currentPage < totalPages - 1) {
-            // Drag from right edge → flip forward
+            const cornerY = pos.y > pageH / 2 ? pageH : 0;
             isDragging = true;
             flipDirection = 1;
-            dragStartX = pos.x;
-            flipProgress = 0;
+            cornerOrigin = { x: pageW, y: cornerY };
+            pointerPos = { x: pos.x, y: pos.y };
             canvas.style.cursor = 'grabbing';
-        } else if (pos.x < edgeZone && currentPage > 0) {
-            // Drag from left edge → flip backward
+            render();
+            return;
+        }
+        // Left edge → flip backward
+        if (pos.x < edgeZone && currentPage > 0) {
+            const cornerY = pos.y > pageH / 2 ? pageH : 0;
             isDragging = true;
             flipDirection = -1;
-            dragStartX = pos.x;
-            flipProgress = 0;
+            cornerOrigin = { x: 0, y: cornerY };
+            pointerPos = { x: pos.x, y: pos.y };
             canvas.style.cursor = 'grabbing';
+            render();
+            return;
         }
     }
 
     function onPointerMove(e) {
         if (!isDragging) {
-            // Update cursor based on position
-            const pos = getCanvasPos(e);
-            const edgeZone = pageW * 0.25;
-            if ((pos.x > pageW - edgeZone && currentPage < totalPages - 1) ||
-                (pos.x < edgeZone && currentPage > 0)) {
-                canvas.style.cursor = 'grab';
-            } else {
-                canvas.style.cursor = 'default';
-            }
+            const pos = getPointerPos(e);
+            const edgeZone = pageW * 0.30;
+            const nearEdge =
+                (pos.x > pageW - edgeZone && currentPage < totalPages - 1) ||
+                (pos.x < edgeZone && currentPage > 0);
+            canvas.style.cursor = nearEdge ? 'grab' : 'default';
             return;
         }
-
         e.preventDefault();
-        const pos = getCanvasPos(e);
-        dragCurrentX = pos.x;
-
-        const dragDelta = dragStartX - dragCurrentX;
-
-        if (flipDirection === 1) {
-            flipProgress = Math.max(0, Math.min(1, dragDelta / pageW));
-        } else {
-            flipProgress = Math.max(0, Math.min(1, -dragDelta / pageW));
-        }
-
+        pointerPos = getPointerPos(e);
         render();
     }
 
-    function onPointerUp(e) {
+    function onPointerUp() {
         if (!isDragging) return;
         isDragging = false;
         canvas.style.cursor = 'default';
 
-        const threshold = 0.2;
+        const cPtr = constrainPointer(cornerOrigin, pointerPos);
+        const f = computeFold(cornerOrigin, cPtr);
+        const diag = Math.sqrt(pageW * pageW + pageH * pageH);
+        const progress = f ? Math.min(1, f.dist / diag) : 0;
 
-        if (flipProgress > threshold) {
-            // Complete the flip
-            animateFlip(flipDirection, flipProgress);
+        if (progress > 0.18) {
+            animateComplete();
         } else {
-            // Snap back
-            animateSnapBack(flipProgress);
+            animateSnapBack();
         }
     }
 
-    // ─── UI Updates ───
-    function updateUI() {
-        pageIndicator.textContent = `${currentPage + 1} / ${totalPages}`;
+    // ══════════════════════════════════════════════════════
+    // ─── ANIMATIONS ───
+    // ══════════════════════════════════════════════════════
 
+    function animateComplete() {
+        isAnimating = true;
+        const start = { x: pointerPos.x, y: pointerPos.y };
+        // Target: the opposite side of the page
+        const target = {
+            x: cornerOrigin.x === pageW ? -pageW * 0.35 : pageW * 1.35,
+            y: cornerOrigin.y
+        };
+        playFlipSound();
+        const t0 = performance.now(), dur = 480;
+
+        function step(now) {
+            const t = Math.min((now - t0) / dur, 1);
+            const e = 1 - Math.pow(1 - t, 3);
+            pointerPos = {
+                x: start.x + (target.x - start.x) * e,
+                y: start.y + (target.y - start.y) * e
+            };
+            render();
+            if (t < 1) { requestAnimationFrame(step); }
+            else {
+                currentPage += flipDirection;
+                isAnimating = false;
+                flipDirection = 0;
+                render();
+                updateUI();
+            }
+        }
+        requestAnimationFrame(step);
+    }
+
+    function animateSnapBack() {
+        isAnimating = true;
+        const start = { x: pointerPos.x, y: pointerPos.y };
+        const target = { x: cornerOrigin.x, y: cornerOrigin.y };
+        const t0 = performance.now(), dur = 320;
+
+        function step(now) {
+            const t = Math.min((now - t0) / dur, 1);
+            const e = 1 - Math.pow(1 - t, 3) * Math.cos(t * Math.PI * 0.3);
+            pointerPos = {
+                x: start.x + (target.x - start.x) * Math.min(1, e),
+                y: start.y + (target.y - start.y) * Math.min(1, e)
+            };
+            render();
+            if (t < 1) { requestAnimationFrame(step); }
+            else {
+                isAnimating = false;
+                flipDirection = 0;
+                render();
+            }
+        }
+        requestAnimationFrame(step);
+    }
+
+    function autoFlip(dir) {
+        if (isAnimating || isDragging) return;
+        const target = currentPage + dir;
+        if (target < 0 || target >= totalPages) return;
+        initAudio();
+        flipDirection = dir;
+        cornerOrigin = { x: dir === 1 ? pageW : 0, y: pageH };
+        pointerPos = { x: dir === 1 ? pageW - 3 : 3, y: pageH - 3 };
+        animateComplete();
+    }
+
+    // ─── UI ───
+    function updateUI() {
+        pageIndicator.textContent = (currentPage + 1) + ' / ' + totalPages;
         navLeft.classList.toggle('disabled', currentPage <= 0);
         navRight.classList.toggle('disabled', currentPage >= totalPages - 1);
     }
 
-    // ─── Event Listeners ───
+    // ─── Events ───
     function bindEvents() {
-        // Mouse events
         canvas.addEventListener('mousedown', onPointerDown);
         window.addEventListener('mousemove', onPointerMove);
         window.addEventListener('mouseup', onPointerUp);
-
-        // Touch events
         canvas.addEventListener('touchstart', onPointerDown, { passive: true });
         window.addEventListener('touchmove', onPointerMove, { passive: false });
         window.addEventListener('touchend', onPointerUp);
-
-        // Navigation arrows
-        navLeft.addEventListener('click', () => {
-            if (!isFlipping && currentPage > 0) {
-                initAudio();
-                animateFlip(-1, 0);
-            }
-        });
-
-        navRight.addEventListener('click', () => {
-            if (!isFlipping && currentPage < totalPages - 1) {
-                initAudio();
-                animateFlip(1, 0);
-            }
-        });
-
-        // Keyboard
+        navLeft.addEventListener('click', () => autoFlip(-1));
+        navRight.addEventListener('click', () => autoFlip(1));
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-                if (!isFlipping && currentPage < totalPages - 1) {
-                    initAudio();
-                    animateFlip(1, 0);
-                }
-            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-                if (!isFlipping && currentPage > 0) {
-                    initAudio();
-                    animateFlip(-1, 0);
-                }
-            }
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown') autoFlip(1);
+            else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') autoFlip(-1);
         });
-
-        // Resize
-        window.addEventListener('resize', () => {
-            calculateDimensions();
-            render();
-        });
+        window.addEventListener('resize', () => { calculateDimensions(); render(); });
     }
 
     // ─── Init ───
     async function init() {
         calculateDimensions();
-
-        // Show loading state
-        ctx.fillStyle = '#2a2a2a';
-        ctx.fillRect(0, 0, canvasW, canvasH);
-        ctx.fillStyle = 'rgba(255,255,255,0.5)';
-        ctx.font = '16px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Loading menu...', canvasW / 2, canvasH / 2);
+        ctx.fillStyle = '#2a2a2a'; ctx.fillRect(0, 0, pageW, pageH);
+        ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('Loading menu…', pageW / 2, pageH / 2);
 
         try {
             pages = await loadImages();
             totalPages = pages.length;
-            currentPage = 0;
-
             render();
             updateUI();
             bindEvents();
+
+            // Hint: brief corner curl peek
+            setTimeout(() => {
+                if (isAnimating || isDragging) return;
+                flipDirection = 1;
+                cornerOrigin = { x: pageW, y: pageH };
+                isAnimating = true;
+                const dur = 900, t0 = performance.now();
+                const peekX = pageW * 0.78, peekY = pageH * 0.82;
+                (function step(now) {
+                    const t = Math.min((now - t0) / dur, 1);
+                    if (t < 0.45) {
+                        const e = Math.sin((t / 0.45) * Math.PI / 2);
+                        pointerPos = { x: pageW + (peekX - pageW) * e, y: pageH + (peekY - pageH) * e };
+                    } else {
+                        const e = 1 - Math.pow(1 - (t - 0.45) / 0.55, 2);
+                        pointerPos = { x: peekX + (pageW - peekX) * e, y: peekY + (pageH - peekY) * e };
+                    }
+                    render();
+                    if (t < 1) requestAnimationFrame(step);
+                    else { isAnimating = false; flipDirection = 0; render(); }
+                })(performance.now());
+            }, 800);
         } catch (err) {
-            ctx.clearRect(0, 0, canvasW, canvasH);
-            ctx.fillStyle = '#2a2a2a';
-            ctx.fillRect(0, 0, canvasW, canvasH);
-            ctx.fillStyle = '#ff6b6b';
-            ctx.font = '14px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText('Error loading menu pages. Please refresh.', canvasW / 2, canvasH / 2);
+            ctx.clearRect(0, 0, pageW, pageH);
+            ctx.fillStyle = '#2a2a2a'; ctx.fillRect(0, 0, pageW, pageH);
+            ctx.fillStyle = '#ff6b6b'; ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText('Error loading menu. Please refresh.', pageW / 2, pageH / 2);
             console.error(err);
         }
     }
